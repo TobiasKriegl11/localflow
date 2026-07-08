@@ -78,6 +78,8 @@ def load() -> Settings:
                     s._extra[k] = v  # preserve unknown keys across save
     except Exception:
         log.exception("Bad settings file, using defaults")
+    if isinstance(s.auto_languages, str):  # hand-edited scalar, e.g. "de, en"
+        s.auto_languages = s.auto_languages.replace(",", " ").split()
     return s
 
 

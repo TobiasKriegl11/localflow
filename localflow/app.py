@@ -33,18 +33,8 @@ class LocalFlowApp:
             model, device = self.settings.model, "cpu"
         # '.en' models only for explicit English; multilingual otherwise.
         model = model_for_language(model, self.settings.language)
-        hint = self.settings.language_hint
-        try:
-            self.transcriber = Transcriber(model_name=model, device=device,
-                                           language_hint=hint)
-        except Exception:
-            if device != "cpu":
-                log.exception("%s on %s failed, falling back to CPU", model, device)
-                device = "cpu"
-                self.transcriber = Transcriber(model_name=model, device="cpu",
-                                               language_hint=hint)
-            else:
-                raise
+        self.device = device
+        self.transcriber = self._make_transcriber(model)
         self.model_name = model
 
         # First run in auto mode: speed-benchmark base.en, upgrade if in budget.
@@ -73,6 +63,20 @@ class LocalFlowApp:
         if self.settings.llm_cleanup:
             self._load_cleaner()
 
+    def _make_transcriber(self, model: str) -> Transcriber:
+        """Single construction path: device + hint + CUDA→CPU fallback."""
+        try:
+            return Transcriber(model_name=model, device=self.device,
+                               language_hint=self.settings.language_hint)
+        except Exception:
+            if self.device != "cpu":
+                log.exception("%s on %s failed, falling back to CPU",
+                              model, self.device)
+                self.device = "cpu"
+                return Transcriber(model_name=model, device="cpu",
+                                   language_hint=self.settings.language_hint)
+            raise
+
     def _auto_tier(self, device: str) -> None:
         from localflow.tiering import benchmark_base_seconds, decide_upgrade
 
@@ -85,9 +89,7 @@ class LocalFlowApp:
             # needs the multilingual one (small, not small.en).
             upgrade = model_for_language(upgrade, self.settings.language)
             try:
-                self.transcriber = Transcriber(
-                    model_name=upgrade, device=device,
-                    language_hint=self.settings.language_hint)
+                self.transcriber = self._make_transcriber(upgrade)
                 self.model_name = upgrade
             except Exception:
                 log.exception("Upgrade to %s failed (offline?); keeping %s",
@@ -115,8 +117,7 @@ class LocalFlowApp:
 
         def reload() -> None:
             try:
-                t = Transcriber(model_name=new_model,
-                                language_hint=self.settings.language_hint)
+                t = self._make_transcriber(new_model)
                 t.warm_up()
                 self.transcriber = t  # atomic swap; old model keeps serving until now
                 self.model_name = new_model
@@ -208,24 +209,26 @@ class LocalFlowApp:
 
     def _process(self, audio, released_at: float) -> None:
         try:
-            text = self.transcriber.transcribe(
+            # Stable ref: a tray language switch may swap self.transcriber
+            # mid-take; this thread finishes on the instance it started with.
+            tr = self.transcriber
+            text, lang = tr.transcribe_take(
                 audio, language=self.settings.language, hotwords=vocab.hotwords(),
                 allowed_languages=self.settings.auto_languages)
             if not text:
                 log.info("No speech detected")
                 return
             if self.settings.llm_cleanup and self.cleaner is not None:
-                text = self.cleaner.clean(text, lang=self.transcriber.last_language)
+                text = self.cleaner.clean(text, lang=lang)
             inject_text(text)
             self.history.appendleft((time.strftime("%H:%M"), text))
             if self.tray:
                 self.tray.refresh()
-            # Remember the session's dominant language across restarts.
-            if self.settings.language == "auto":
-                dominant = self.transcriber.dominant_language()
-                if dominant and dominant != self.settings.language_hint:
-                    self.settings.language_hint = dominant
-                    config.save(self.settings)
+            # Remember the verified language anchor across restarts.
+            if self.settings.language == "auto" and lang \
+                    and lang != self.settings.language_hint:
+                self.settings.language_hint = lang
+                config.save(self.settings)
             log.info("End-to-end latency (release -> paste): %.2fs",
                      time.perf_counter() - released_at)
         except Exception:
