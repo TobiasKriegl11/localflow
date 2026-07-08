@@ -1,0 +1,12 @@
+# llama-cpp-python: pin 0.2.90 — newer prebuilt CPU wheels crash with illegal
+# instruction (0xc000001d) on CPUs without AVX-512 (e.g. i5-1235U).
+# Install with: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+llama-cpp-python==0.2.90
+faster-whisper>=1.2
+sounddevice>=0.5
+pynput>=1.7
+pyperclip>=1.9
+numpy>=1.26
+pystray>=0.19
+pillow>=10
+pyyaml>=6
