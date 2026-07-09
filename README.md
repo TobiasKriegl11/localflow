@@ -89,3 +89,7 @@ needs Accessibility + Microphone permissions on first run).
 - No live streaming preview yet (text appears after you stop speaking).
 - Languages: German and English get AI cleanup; other languages transcribe raw
   (tray → Sprache/Language → Automatisch).
+
+---
+
+Built with [Claude Code](https://claude.com/claude-code).
