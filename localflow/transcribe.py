@@ -23,11 +23,15 @@ log = logging.getLogger(__name__)
 DEFAULT_MODEL = "base.en"
 
 # Leaving the anchor language requires whisper to detect the challenger with at
-# least this raw probability. Measured on de/en clips, correct detections land at
+# least this RAW probability. Measured on de/en clips, correct detections land at
 # 0.85-1.00 while the lone misdetection (a 1.2s "Ja." heard as English) sat at
 # 0.61 — so a gate here rejects the flukes without blocking real switches.
+# Deliberately the raw posterior, NOT renormalized over the allowed set:
+# renormalizing that "Ja." (de 0.02 / en 0.61) would inflate it to 0.97 and let
+# the fluke through. A corollary is that broadening `auto_languages` beyond two
+# only makes switching *more* conservative (mass is split across more languages),
+# which is the safe direction — retune this only if real switches feel sluggish.
 SWITCH_DET_PROB = 0.70
-SWITCH_MIN_SECONDS = 0.6  # ignore sub-second blips as switch triggers
 
 _DECODE_OPTS = dict(
     beam_size=5,  # slightly slower than greedy, clearly better on real mics
@@ -90,13 +94,44 @@ class Transcriber:
 
     @staticmethod
     def _ranked_allowed(all_probs, allowed: list[str]):
-        """Detection probs sorted desc, restricted to the allowed set if any."""
+        """Detection probs sorted desc, restricted to the allowed set if any.
+
+        When detection returns nothing inside a non-empty allowed set, present
+        the allowed languages themselves at zero confidence — so the caller
+        picks an *allowed* language (unconfidently) instead of leaking a
+        disallowed one that happened to top the raw detection.
+        """
         ranked = sorted(all_probs, key=lambda lp: -lp[1])
         if allowed:
             within = [lp for lp in ranked if lp[0] in allowed]
-            if within:
-                ranked = within
+            ranked = within or [(lang, 0.0) for lang in allowed]
         return ranked
+
+    @staticmethod
+    def _choose_language(det: str, p_det: float, anchor: str,
+                         fallback: str) -> str:
+        """Pick a take's language. Pure/deterministic so it can be unit-tested.
+
+        Keep the anchor unless a *different* language is detected confidently.
+        With no anchor, take a confident detection, else the stable fallback —
+        so a single unsure short take never sets (or persists) the session
+        language. `det`/`fallback` are assumed already inside the allowed set.
+        """
+        confident = p_det >= SWITCH_DET_PROB
+        if anchor and (det == anchor or not confident):
+            return anchor
+        if confident:
+            return det
+        return fallback
+
+    def _fallback_lang(self, det: str, allowed: list[str]) -> str:
+        """A stable in-set language to hold when we have no confident signal."""
+        last = self.last_language
+        if last and (not allowed or last in allowed):
+            return last
+        if allowed:
+            return allowed[0]
+        return det
 
     # -- public API ----------------------------------------------------------
 
@@ -150,17 +185,10 @@ class Transcriber:
         if cur and allowed and cur not in allowed:
             cur = ""  # settings were narrowed after the anchor was set
 
-        duration = audio.size / 16_000
-        if not cur:
-            target = det                    # no anchor yet: trust detection
-        elif det == cur:
-            target = cur                    # detection agrees — nothing to decide
-        elif p_det >= SWITCH_DET_PROB and duration >= SWITCH_MIN_SECONDS:
-            target = det                    # confident, substantial disagreement
-        else:
-            target = cur                    # unsure / too short: hold the anchor
-        log.info("Language: det=%s p=%.2f anchor=%s dur=%.1fs -> %s",
-                 det, p_det, cur or "-", duration, target)
+        fallback = self._fallback_lang(det, allowed)
+        target = self._choose_language(det, p_det, cur, fallback)
+        log.info("Language: det=%s p=%.2f anchor=%s -> %s",
+                 det, p_det, cur or "-", target)
 
         # One decode, in the chosen language (reuse the detection pass if it fits).
         text = (self._text(list(segments)) if info.language == target

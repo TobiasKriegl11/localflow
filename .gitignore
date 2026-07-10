@@ -5,3 +5,4 @@ models/
 __pycache__/
 *.pyc
 *.spec.bak
+tests/_tts_cache/
