@@ -4,7 +4,7 @@
 ; Build: ISCC.exe installer\localflow_slim.iss  (after PyInstaller build)
 
 #define AppName "LocalFlow"
-#define AppVersion "0.1.0"
+#define AppVersion "0.1.1"
 #define AppExe "LocalFlow.exe"
 
 [Setup]
