@@ -29,13 +29,14 @@ LANGUAGES = [("auto", "Automatisch / Auto"), ("de", "Deutsch"), ("en", "English"
 class Tray:
     def __init__(self, settings: config.Settings, status: str,
                  on_toggle_cleanup, on_set_language, on_quit,
-                 history=None, on_open_vocab=None) -> None:
+                 history=None, on_open_vocab=None, on_toggle_accuracy=None) -> None:
         self.settings = settings
         self._on_toggle_cleanup = on_toggle_cleanup
         self._on_set_language = on_set_language
         self._on_quit = on_quit
         self._history = history if history is not None else []
         self._on_open_vocab = on_open_vocab
+        self._on_toggle_accuracy = on_toggle_accuracy
         lang_items = [
             pystray.MenuItem(label, self._make_lang_setter(code), radio=True,
                              checked=(lambda code: lambda _:
@@ -51,6 +52,9 @@ class Tray:
             pystray.MenuItem("Wörterbuch / Vocabulary…", self._open_vocab),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Sprache / Language", pystray.Menu(*lang_items)),
+            pystray.MenuItem("Höhere Genauigkeit / Higher accuracy",
+                             self._toggle_accuracy,
+                             checked=lambda _: self.settings.high_accuracy),
             pystray.MenuItem("AI cleanup", self._toggle_cleanup,
                              checked=lambda _: self.settings.llm_cleanup),
             pystray.MenuItem("Töne / Sounds", self._toggle_sounds,
@@ -107,6 +111,10 @@ class Tray:
         self.settings.llm_cleanup = not self.settings.llm_cleanup
         config.save(self.settings)
         self._on_toggle_cleanup(self.settings.llm_cleanup)
+
+    def _toggle_accuracy(self, _icon, _item) -> None:
+        if self._on_toggle_accuracy:
+            self._on_toggle_accuracy(not self.settings.high_accuracy)
 
     def _toggle_login(self, _icon, _item) -> None:
         target = not self.settings.start_on_login

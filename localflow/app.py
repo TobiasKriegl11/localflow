@@ -22,7 +22,13 @@ class LocalFlowApp:
     def __init__(self) -> None:
         self.settings = config.load()
 
-        if self.settings.model == "auto":
+        if self.settings.high_accuracy:
+            # Accuracy mode: 'small' multilingual — the only tier that cleanly
+            # handles mid-sentence de/en code-switching. Skips the speed
+            # benchmark deliberately; '.en' is stripped below for de/auto.
+            model = "small.en"
+            device = "cuda" if has_nvidia_gpu() else "cpu"
+        elif self.settings.model == "auto":
             if self.settings.tiered_model:  # benchmark already ran on this machine
                 model, device = self.settings.tiered_model, "cpu"
                 if has_nvidia_gpu():
@@ -38,7 +44,8 @@ class LocalFlowApp:
         self.model_name = model
 
         # First run in auto mode: speed-benchmark base.en, upgrade if in budget.
-        if self.settings.model == "auto" and not self.settings.tiered_model:
+        if not self.settings.high_accuracy \
+                and self.settings.model == "auto" and not self.settings.tiered_model:
             self._auto_tier(device)
 
         self.recorder = Recorder(pre_roll_seconds=self.settings.pre_roll_seconds)
@@ -106,12 +113,14 @@ class LocalFlowApp:
             log.exception("Cleanup LLM unavailable; raw transcripts only")
             self.cleaner = None
 
-    def _set_language(self, lang: str) -> None:
-        """Switch language; reloads the whisper model in the background if needed."""
-        self.settings.language = lang
-        config.save(self.settings)
-        size = self.settings.tiered_model or self.model_name
-        new_model = model_for_language(size, lang)
+    def _select_model(self) -> str:
+        """Whisper model implied by the current language + accuracy settings."""
+        size = "small.en" if self.settings.high_accuracy \
+            else (self.settings.tiered_model or self.model_name)
+        return model_for_language(size, self.settings.language)
+
+    def _reload_model(self, new_model: str) -> None:
+        """Swap the transcriber to `new_model` in the background (atomic)."""
         if new_model == self.model_name:
             return
 
@@ -119,14 +128,27 @@ class LocalFlowApp:
             try:
                 t = self._make_transcriber(new_model)
                 t.warm_up()
-                self.transcriber = t  # atomic swap; old model keeps serving until now
+                self.transcriber = t  # atomic swap; old model serves until now
                 self.model_name = new_model
-                log.info("Switched to %s for language %r", new_model, lang)
+                log.info("Loaded model %s", new_model)
             except Exception:
                 log.exception("Could not load %s (offline?); keeping %s",
                               new_model, self.model_name)
 
         threading.Thread(target=reload, daemon=True).start()
+
+    def _set_language(self, lang: str) -> None:
+        """Switch language; reloads the whisper model in the background if needed."""
+        self.settings.language = lang
+        config.save(self.settings)
+        self._reload_model(self._select_model())
+
+    def _on_toggle_accuracy(self, enabled: bool) -> None:
+        """Toggle the small multilingual model (better code-switching, slower)."""
+        self.settings.high_accuracy = enabled
+        config.save(self.settings)
+        log.info("Accuracy mode %s", "on (small)" if enabled else "off (base)")
+        self._reload_model(self._select_model())
 
     def _on_toggle_cleanup(self, enabled: bool) -> None:
         if enabled and self.cleaner is None:
@@ -250,7 +272,8 @@ class LocalFlowApp:
                              on_set_language=self._set_language,
                              on_quit=self._shutdown,
                              history=self.history,
-                             on_open_vocab=vocab.open_in_editor)
+                             on_open_vocab=vocab.open_in_editor,
+                             on_toggle_accuracy=self._on_toggle_accuracy)
             self.tray.run()  # blocks until Quit
         except Exception:
             log.exception("Tray unavailable, running headless (Ctrl+C to quit)")

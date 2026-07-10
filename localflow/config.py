@@ -24,26 +24,17 @@ def config_dir() -> Path:
 CONFIG_PATH = config_dir() / "settings.yaml"
 
 
-def _default_language() -> str:
-    """System UI language if we have cleanup support for it, else auto-detect."""
-    try:
-        import locale
-        lang = (locale.getlocale()[0] or "")[:2].lower()
-        if sys.platform == "win32":
-            import ctypes
-            lcid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
-            lang = locale.windows_locale.get(lcid, lang)[:2].lower()
-        if lang in ("de", "en"):
-            return lang
-    except Exception:
-        pass
-    return "auto"
+# NOTE: earlier versions seeded the default language from the OS UI locale
+# (returning "de" on a German Windows, etc.). That silently FORCED a single
+# language and disabled detection entirely, so bilingual users had their other
+# language mangled into the forced one (English spoken → "Ich möchte das in eine
+# Real-Funktion..."). Auto-detect is the correct default: it picks de/en per take.
 
 
 @dataclass
 class Settings:
     model: str = "auto"          # auto | tiny.en | base.en | small.en | tiny | base | small
-    language: str = field(default_factory=_default_language)  # auto | en | de
+    language: str = "auto"       # auto (detect de/en per take) | en | de
     llm_cleanup: bool = True     # AI punctuation/filler cleanup (off = raw Whisper)
     hotkey: str = "ctrl+win" if sys.platform == "win32" else "ctrl+alt"
     delivery: str = "paste"      # paste | type (reserved)
@@ -56,6 +47,11 @@ class Settings:
     show_overlay: bool = True
     language_hint: str = ""      # auto mode: dominant language of past sessions
     sound_feedback: bool = True  # blip on record start/stop
+    # Use the 'small' multilingual model. ~3x slower than base on CPU, but the
+    # only tier that cleanly transcribes mid-sentence de/en code-switching
+    # (base garbles the minority-language span). Opt-in; needs the small model
+    # (bundled in the full installer, else downloaded on first enable).
+    high_accuracy: bool = False
     # Auto mode only considers these languages (empty list = all 99).
     auto_languages: list = field(default_factory=lambda: ["de", "en"])
     _extra: dict = field(default_factory=dict, repr=False)
