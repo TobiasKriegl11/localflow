@@ -1,11 +1,13 @@
 """faster-whisper transcription. CPU-first; English-only or multilingual models.
 
-Auto mode keeps ONE anchor: the language of the previous take. Each take is
-decoded in the expected language; when whisper's detection disagrees with the
-anchor — or is unsure between the allowed languages — the take is decoded in
-both candidates and the challenger wins only if its full-take decode reads
-clearly better. So a single bad detection can never flip the session, while a
-genuine language switch takes effect on the very take it happens.
+Auto mode keeps ONE anchor: the language of the previous take. Whisper's own
+language detection (restricted to the allowed set) drives each take, but the
+session only leaves the anchor when detection picks a *different* language
+*confidently* — an unsure or too-short detection sticks with the anchor. This
+kills the mid-session flip-flop (a short "Ja." misheard as English no longer
+derails a German session) while a real switch, which whisper detects with high
+probability, still takes effect on the take it happens. Each take is decoded
+exactly once, in the chosen language.
 """
 
 import logging
@@ -20,9 +22,12 @@ log = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "base.en"
 
-RENORM_CONFIDENT = 0.80  # below this (among allowed langs) detection is "unsure"
-SWITCH_MARGIN = 0.05     # challenger must beat the anchor's decode by this (log-prob)
-NO_SPEECH_MAX = 0.6      # segments above this are ignored when scoring a decode
+# Leaving the anchor language requires whisper to detect the challenger with at
+# least this raw probability. Measured on de/en clips, correct detections land at
+# 0.85-1.00 while the lone misdetection (a 1.2s "Ja." heard as English) sat at
+# 0.61 — so a gate here rejects the flukes without blocking real switches.
+SWITCH_DET_PROB = 0.70
+SWITCH_MIN_SECONDS = 0.6  # ignore sub-second blips as switch triggers
 
 _DECODE_OPTS = dict(
     beam_size=5,  # slightly slower than greedy, clearly better on real mics
@@ -71,24 +76,17 @@ class Transcriber:
         self.model.transcribe(np.zeros(16_000, dtype=np.float32), beam_size=1)
         log.info("Model warmed up")
 
-    # -- decoding & scoring -------------------------------------------------
+    # -- decoding -----------------------------------------------------------
 
     @staticmethod
-    def _score(segs) -> tuple[str, float, int]:
-        """(text, duration-weighted mean log-prob of voiced segments, words)."""
-        text = " ".join(s.text.strip() for s in segs).strip()
-        voiced = [s for s in segs if s.no_speech_prob < NO_SPEECH_MAX]
-        if not voiced or not text:
-            return text, float("-inf"), 0
-        dur = sum(s.end - s.start for s in voiced)
-        lp = sum(s.avg_logprob * (s.end - s.start) for s in voiced) / max(dur, 1e-6)
-        return text, lp, len(text.split())
+    def _text(segs) -> str:
+        """Join a decode's segments into one transcript string."""
+        return " ".join(s.text.strip() for s in segs).strip()
 
-    def _decode(self, audio: np.ndarray, lang: str,
-                hotwords: str | None) -> tuple[str, float, int]:
+    def _decode(self, audio: np.ndarray, lang: str, hotwords: str | None) -> str:
         segments, _ = self.model.transcribe(audio, language=lang,
                                             hotwords=hotwords, **_DECODE_OPTS)
-        return self._score(list(segments))
+        return self._text(list(segments))
 
     @staticmethod
     def _ranked_allowed(all_probs, allowed: list[str]):
@@ -123,10 +121,10 @@ class Transcriber:
             t0 = time.perf_counter()
             if self.is_english_only:
                 lang = "en"
-                text, _, _ = self._decode(audio, lang, hotwords)
+                text = self._decode(audio, lang, hotwords)
             elif language not in ("auto", "", None):
                 lang = language
-                text, _, _ = self._decode(audio, lang, hotwords)
+                text = self._decode(audio, lang, hotwords)
             else:
                 text, lang = self._auto_take(audio, hotwords, allowed_languages)
             self.last_language = lang
@@ -140,44 +138,35 @@ class Transcriber:
             allowed = allowed.replace(",", " ").split()
         allowed = list(allowed or [])
 
-        # Detection pass. Decoding is lazy, so unused segments cost nothing.
+        # Detection pass. Decoding is lazy, so the segments cost nothing until
+        # (and unless) we consume them for the chosen language below.
         segments, info = self.model.transcribe(audio, language=None,
                                                hotwords=hotwords, **_DECODE_OPTS)
         ranked = self._ranked_allowed(info.all_language_probs
                                       or [(info.language, 1.0)], allowed)
-        det = ranked[0][0]
-        confidence = (ranked[0][1] / (ranked[0][1] + ranked[1][1])
-                      if len(ranked) > 1 else 1.0)
+        det, p_det = ranked[0]  # top allowed language + its raw probability
 
         cur = self.current_language
         if cur and allowed and cur not in allowed:
             cur = ""  # settings were narrowed after the anchor was set
+
+        duration = audio.size / 16_000
         if not cur:
-            cur = det
+            target = det                    # no anchor yet: trust detection
+        elif det == cur:
+            target = cur                    # detection agrees — nothing to decide
+        elif p_det >= SWITCH_DET_PROB and duration >= SWITCH_MIN_SECONDS:
+            target = det                    # confident, substantial disagreement
+        else:
+            target = cur                    # unsure / too short: hold the anchor
+        log.info("Language: det=%s p=%.2f anchor=%s dur=%.1fs -> %s",
+                 det, p_det, cur or "-", duration, target)
 
-        targets = {cur, det}
-        if confidence < RENORM_CONFIDENT and len(targets) == 1 and len(ranked) > 1:
-            targets.add(ranked[1][0])  # unsure detection: verify vs the runner-up
+        # One decode, in the chosen language (reuse the detection pass if it fits).
+        text = (self._text(list(segments)) if info.language == target
+                else self._decode(audio, target, hotwords))
 
-        decodes: dict[str, tuple[str, float, int]] = {}
-        if info.language in targets:
-            decodes[info.language] = self._score(list(segments))
-        for lang in targets - decodes.keys():
-            decodes[lang] = self._decode(audio, lang, hotwords)
-
-        winner = cur
-        challenger = next((c for c in targets if c != cur), None)
-        if challenger is not None:
-            _, s_cur, n_cur = decodes[cur]
-            _, s_ch, n_ch = decodes[challenger]
-            # A much shorter decode is a hallucination tell, not real speech.
-            suspect = n_ch * 2 < n_cur
-            if s_ch > s_cur + SWITCH_MARGIN and not suspect:
-                winner = challenger
-            log.info("Language check %s %.2f vs %s %.2f (det %s p=%.2f) -> %s",
-                     cur, s_cur, challenger, s_ch, det,
-                     info.language_probability, winner)
-        if self.current_language and winner != self.current_language:
-            log.info("Language switch %s -> %s", self.current_language, winner)
-        self.current_language = winner
-        return decodes[winner][0], winner
+        if self.current_language and target != self.current_language:
+            log.info("Language switch %s -> %s", self.current_language, target)
+        self.current_language = target
+        return text, target
